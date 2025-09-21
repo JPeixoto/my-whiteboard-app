@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+server/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -33,9 +34,14 @@ yarn-error.log*
 # env files (can opt-in for committing if needed)
 .env*
 
+# local sqlite databases
+prisma/*.db
+
 # vercel
 .vercel
 
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/src/generated/prisma
