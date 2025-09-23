@@ -23,8 +23,9 @@ export const handlePaste = (
       reader.onload = (event) => {
         const img = new Image();
         img.onload = () => {
-          const x = (e.clientX - pan.x) / zoom;
-          const y = (e.clientY - pan.y) / zoom;
+          // Place pasted image at canvas center in world coordinates
+          const x = (context.canvas.width / 2 - pan.x) / zoom;
+          const y = (context.canvas.height / 2 - pan.y) / zoom;
           const newImage: Img = {
             id: Date.now(),
             x,

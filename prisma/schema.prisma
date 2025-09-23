@@ -44,6 +44,8 @@ model User {
   email         String?   @unique
   emailVerified DateTime?
   image         String?
+  // For credentials (password-based) auth
+  passwordHash  String?
   accounts      Account[]
   sessions      Session[]
 }

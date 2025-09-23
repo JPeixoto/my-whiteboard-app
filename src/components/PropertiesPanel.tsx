@@ -1,19 +1,47 @@
-"use client";
+"use client"
 
-import React, { useState } from 'react';
-import type { BrushStyle } from '@/types/whiteboard';
+import { useMemo } from "react"
+import { Brush, Droplet } from "lucide-react"
+import type { BrushStyle, Tool } from "@/types/whiteboard"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Slider } from "@/components/ui/slider"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { cn } from "@/lib/utils"
 
-const brushLabels: { key: BrushStyle; label: string }[] = [
-  { key: 'brush', label: 'Brush' },
-  { key: 'calligraphy-brush', label: 'Calligraphy brush' },
-  { key: 'calligraphy-pen', label: 'Calligraphy pen' },
-  { key: 'airbrush', label: 'Airbrush' },
-  { key: 'oil-brush', label: 'Oil brush' },
-  { key: 'crayon', label: 'Crayon' },
-  { key: 'marker', label: 'Marker' },
-  { key: 'natural-pencil', label: 'Natural pencil' },
-  { key: 'watercolor-brush', label: 'Watercolor brush' },
-];
+const brushLabels: { key: BrushStyle; label: string; hint: string }[] = [
+  { key: "brush", label: "Classic", hint: "Balanced line" },
+  { key: "calligraphy-brush", label: "Calligraphy", hint: "Expressive stroke" },
+  { key: "calligraphy-pen", label: "Calligraphy pen", hint: "Sharp edges" },
+  { key: "airbrush", label: "Airbrush", hint: "Soft texture" },
+  { key: "oil-brush", label: "Oil", hint: "Rich paint" },
+  { key: "crayon", label: "Crayon", hint: "Layered grain" },
+  { key: "marker", label: "Marker", hint: "Bold highlight" },
+  { key: "natural-pencil", label: "Pencil", hint: "Sketchy" },
+  { key: "watercolor-brush", label: "Watercolor", hint: "Diffuse" },
+]
+
+const colorPresets = [
+  "#1F2937",
+  "#ef4444",
+  "#22c55e",
+  "#3b82f6",
+  "#8b5cf6",
+  "#f59e0b",
+  "#14b8a6",
+]
+
+interface PropertiesPanelProps {
+  color: string
+  strokeWidth: number
+  setColor: (color: string) => void
+  setStrokeWidth: (width: number) => void
+  brushStyle: BrushStyle
+  setBrushStyle: (style: BrushStyle) => void
+  tool: Tool
+}
 
 export default function PropertiesPanel({
   color,
@@ -22,69 +50,94 @@ export default function PropertiesPanel({
   setStrokeWidth,
   brushStyle,
   setBrushStyle,
-}: {
-  color: string;
-  strokeWidth: number;
-  setColor: (c: string) => void;
-  setStrokeWidth: (w: number) => void;
-  brushStyle: BrushStyle;
-  setBrushStyle: (b: BrushStyle) => void;
-}) {
-  const [open, setOpen] = useState(false);
+  tool,
+}: PropertiesPanelProps) {
+  const strokeLabel = tool === "eraser" ? "Eraser size" : "Stroke width"
+  const strokeMax = tool === "eraser" ? 60 : 20
+  const activeBrush = useMemo(() => brushLabels.find((item) => item.key === brushStyle)?.label ?? "Classic", [brushStyle])
+
   return (
-    <div className="absolute top-1/2 right-4 -translate-y-1/2 bg-white/85 backdrop-blur shadow-xl rounded-xl p-3 flex flex-col space-y-4 z-10 w-64">
-      <div>
-        <div className="text-[11px] uppercase tracking-wide text-gray-500 mb-2">Appearance</div>
-        <label className="block text-xs text-gray-600 mb-1">Color & Brush</label>
-        <div className="relative flex items-center gap-2">
-          <input
-            aria-label="Stroke color"
-            type="color"
-            value={color}
-            onChange={(e) => setColor(e.target.value)}
-            className="w-10 h-10 p-0 border rounded"
-          />
-          <button
-            type="button"
-            onClick={() => setOpen(!open)}
-            className="flex-1 flex items-center justify-between px-2 py-2 text-sm border rounded hover:bg-gray-50"
-            aria-haspopup="listbox"
-            aria-expanded={open}
-          >
-            <span className="text-gray-800">{brushLabels.find(b => b.key===brushStyle)?.label || 'Brush'}</span>
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-gray-600" viewBox="0 0 20 20" fill="currentColor">
-              <path fillRule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 10.94l3.71-3.71a.75.75 0 111.06 1.06l-4.24 4.24a.75.75 0 01-1.06 0L5.21 8.29a.75.75 0 01.02-1.08z" clipRule="evenodd" />
-            </svg>
-          </button>
-          {open && (
-            <div className="absolute z-20 top-full right-0 mt-1 w-56 bg-white/95 backdrop-blur shadow-xl rounded-md p-1 border">
-              {brushLabels.map((b) => (
-                <button
-                  key={b.key}
-                  onClick={() => { setBrushStyle(b.key); setOpen(false); }}
-                  className={`w-full flex items-center justify-between px-3 py-2 rounded hover:bg-gray-100 text-left ${brushStyle===b.key ? 'bg-gray-100' : ''}`}
-                >
-                  <span className="text-sm text-gray-800">{b.label}</span>
-                  <span className="w-20 h-4 rounded bg-gray-300"></span>
-                </button>
-              ))}
+    <aside className="pointer-events-auto fixed right-6 top-1/2 z-30 -translate-y-1/2 w-72">
+      <Card className="overflow-hidden border-border/50 bg-background/70 shadow-xl backdrop-blur">
+        <CardHeader className="pb-4">
+          <CardTitle className="flex items-center gap-2 text-sm font-semibold tracking-wide text-muted-foreground">
+            <Brush className="h-4 w-4" /> Appearance
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-6">
+          <section className="space-y-3">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Color</Label>
+            <div className="flex items-center gap-3">
+              <div className="flex h-12 w-12 items-center justify-center rounded-lg border border-border/60 bg-background">
+                <Input
+                  aria-label="Stroke color"
+                  type="color"
+                  value={color}
+                  onChange={(event) => setColor(event.target.value)}
+                  className="h-10 w-10 cursor-pointer border-none bg-transparent p-0"
+                />
+              </div>
+              <div className="grid flex-1 grid-cols-4 gap-2">
+                {colorPresets.map((preset) => (
+                  <button
+                    type="button"
+                    key={preset}
+                    onClick={() => setColor(preset)}
+                    className={cn(
+                      "h-8 rounded-md border border-transparent transition",
+                      color.toLowerCase() === preset.toLowerCase()
+                        ? "ring-2 ring-offset-1 ring-primary"
+                        : "hover:opacity-90"
+                    )}
+                    style={{ backgroundColor: preset }}
+                    aria-label={`Select ${preset} color`}
+                  />
+                ))}
+              </div>
             </div>
-          )}
-        </div>
-      </div>
-      <div>
-        <label className="block text-xs text-gray-600 mb-1">Stroke Width: {strokeWidth}px</label>
-        <input
-          aria-label="Stroke width"
-          type="range"
-          min={1}
-          max={20}
-          value={strokeWidth}
-          onChange={(e) => setStrokeWidth(parseInt(e.target.value, 10))}
-          className="w-full"
-        />
-      </div>
-      
-    </div>
-  );
+          </section>
+
+          <section className="space-y-3">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Brush style</Label>
+            <div className="rounded-lg border border-border/60 bg-muted/10">
+              <ScrollArea className="h-40">
+                <div className="flex flex-col p-2">
+                  {brushLabels.map((item) => (
+                    <Button
+                      key={item.key}
+                      variant={item.key === brushStyle ? "secondary" : "ghost"}
+                      className="justify-between px-3 py-2 text-sm"
+                      onClick={() => setBrushStyle(item.key)}
+                    >
+                      <span className="font-medium text-foreground">{item.label}</span>
+                      <span className="text-xs text-muted-foreground">{item.hint}</span>
+                    </Button>
+                  ))}
+                </div>
+              </ScrollArea>
+            </div>
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Droplet className="h-3.5 w-3.5" /> {activeBrush}
+            </p>
+          </section>
+
+          <section className="space-y-3">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+              {strokeLabel}
+              <span className="ml-2 rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+                {strokeWidth}px
+              </span>
+            </Label>
+            <Slider
+              value={[strokeWidth]}
+              min={1}
+              max={strokeMax}
+              step={1}
+              onValueChange={([value]) => setStrokeWidth(value)}
+            />
+          </section>
+        </CardContent>
+      </Card>
+    </aside>
+  )
 }

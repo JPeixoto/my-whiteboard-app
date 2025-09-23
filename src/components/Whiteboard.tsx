@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import io, { Socket } from 'socket.io-client';
 import { handlePaste } from '../lib/imageUtils';
 import type { Tool, ShapeType, Path, Shape, Img, TextElement, BrushStyle } from '@/types/whiteboard';
@@ -20,6 +20,11 @@ interface WhiteboardProps {
 
 const HANDLE_SIZE = 8;
 
+type TextChange =
+  | { type: 'create'; element: TextElement; broadcast?: boolean }
+  | { type: 'update'; element: TextElement }
+  | { type: 'delete'; id: number };
+
 const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth, clear, setClear, zoom, setZoom, shape, brushStyle = 'brush' }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [context, setContext] = useState<CanvasRenderingContext2D | null>(null);
@@ -38,6 +43,154 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
   const [pan, setPan] = useState({ x: 0, y: 0 });
 
   const [loading, setLoading] = useState(false);
+  const measurementCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pendingTextBroadcast = useRef<Set<number>>(new Set());
+  const [creatingTextId, setCreatingTextId] = useState<number | null>(null);
+
+  const measureTextDimensions = useCallback(
+    (
+      textValue: string,
+      fontSize: number,
+      fontFamily: string,
+      fallbackWidth = fontSize * 4,
+      fallbackHeight = fontSize * 1.4
+    ) => {
+      if (typeof document === 'undefined') {
+        return {
+          width: Math.max(fallbackWidth, fontSize),
+          height: Math.max(fallbackHeight, fontSize * 1.2),
+        };
+      }
+      let canvas = measurementCanvasRef.current;
+      if (!canvas) {
+        canvas = document.createElement('canvas');
+        measurementCanvasRef.current = canvas;
+      }
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return {
+          width: Math.max(fallbackWidth, fontSize),
+          height: Math.max(fallbackHeight, fontSize * 1.2),
+        };
+      }
+      ctx.font = `${fontSize}px ${fontFamily}`;
+      const lines = (textValue ?? '').split('\n');
+      const lineHeight = fontSize * 1.2;
+      let maxWidth = 0;
+      lines.forEach((line) => {
+        const metrics = ctx.measureText(line.length ? line : ' ');
+        maxWidth = Math.max(maxWidth, metrics.width);
+      });
+      const height = Math.max(lineHeight * Math.max(lines.length, 1), fallbackHeight);
+      const width = Math.max(maxWidth, fallbackWidth);
+      return { width, height };
+    },
+    []
+  );
+
+    // Geometry helpers for eraser hit-testing
+  const distancePointToSegment = (px: number, py: number, x1: number, y1: number, x2: number, y2: number) => {
+    const dx = x2 - x1;
+    const dy = y2 - y1;
+    if (dx === 0 && dy === 0) {
+      const ddx = px - x1;
+      const ddy = py - y1;
+      return Math.hypot(ddx, ddy);
+    }
+    const t = Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)));
+    const projX = x1 + t * dx;
+    const projY = y1 + t * dy;
+    return Math.hypot(px - projX, py - projY);
+  };
+
+  const pathIntersectsCircle = (path: Path, cx: number, cy: number, r: number) => {
+    if (!path.points || path.points.length === 0) return false;
+    for (let i = 0; i < path.points.length - 1; i++) {
+      const p1 = path.points[i];
+      const p2 = path.points[i + 1];
+      if (distancePointToSegment(cx, cy, p1.x, p1.y, p2.x, p2.y) <= r) {
+        return true;
+      }
+    }
+    // Single point fallback
+    if (path.points.length === 1) {
+      const p = path.points[0];
+      if (Math.hypot(p.x - cx, p.y - cy) <= r) return true;
+    }
+    return false;
+  };
+
+  const rectIntersectsCircle = (x: number, y: number, w: number, h: number, cx: number, cy: number, r: number) => {
+    // Check distance to each edge segment
+    const x2 = x + w;
+    const y2 = y + h;
+    const hit =
+      distancePointToSegment(cx, cy, x, y, x2, y) <= r || // top
+      distancePointToSegment(cx, cy, x2, y, x2, y2) <= r || // right
+      distancePointToSegment(cx, cy, x2, y2, x, y2) <= r || // bottom
+      distancePointToSegment(cx, cy, x, y2, x, y) <= r; // left
+    return hit;
+  };
+
+  const triangleIntersectsCircle = (x: number, y: number, w: number, h: number, cx: number, cy: number, r: number) => {
+    const p1 = { x: x + w / 2, y: y };
+    const p2 = { x: x, y: y + h };
+    const p3 = { x: x + w, y: y + h };
+    return (
+      distancePointToSegment(cx, cy, p1.x, p1.y, p2.x, p2.y) <= r ||
+      distancePointToSegment(cx, cy, p2.x, p2.y, p3.x, p3.y) <= r ||
+      distancePointToSegment(cx, cy, p3.x, p3.y, p1.x, p1.y) <= r
+    );
+  };
+
+  const ellipseIntersectsCircle = (x: number, y: number, w: number, h: number, cx: number, cy: number, r: number) => {
+    // Approximate by normalized radial distance from ellipse center
+    const rx = Math.abs(w) / 2;
+    const ry = Math.abs(h) / 2;
+    if (rx === 0 || ry === 0) return false;
+    const ex = x + w / 2;
+    const ey = y + h / 2;
+    const nx = (cx - ex) / rx;
+    const ny = (cy - ey) / ry;
+    const radial = Math.hypot(nx, ny);
+    // If close to 1 within tolerance derived from r and average radius
+    const avgR = (rx + ry) / 2;
+    const tol = (r) / Math.max(1, avgR);
+    return Math.abs(radial - 1) <= tol;
+  };
+
+  const eraseAtPoint = (x: number, y: number) => {
+    const radius = Math.max(1, strokeWidth);
+    // Remove paths that intersect the eraser circle
+    let changed = false;
+    const filteredPaths = paths.filter((p) => {
+      const hit = pathIntersectsCircle(p, x, y, radius);
+      if (hit) changed = true;
+      return !hit;
+    });
+    if (changed) setPaths(filteredPaths);
+
+    // Remove shapes when their outline intersects with the eraser circle
+    let shapesChanged = false;
+    const filteredShapes = shapes.filter((s) => {
+      const r = radius + Math.max(1, s.strokeWidth) / 2;
+      let hit = false;
+      switch (s.type) {
+        case 'rectangle':
+          hit = rectIntersectsCircle(s.x, s.y, s.width, s.height, x, y, r);
+          break;
+        case 'circle':
+          hit = ellipseIntersectsCircle(s.x, s.y, s.width, s.height, x, y, r);
+          break;
+        case 'triangle':
+          hit = triangleIntersectsCircle(s.x, s.y, s.width, s.height, x, y, r);
+          break;
+      }
+      if (hit) shapesChanged = true;
+      return !hit;
+    });
+    if (shapesChanged) setShapes(filteredShapes);
+  };
   const [editingTextElement, setEditingTextElement] = useState<TextElement | null>(null);
 
   useEffect(() => {
@@ -74,43 +227,84 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
     newSocket.on('drawing', (data) => {
       if (data.newPath) {
         const np = data.newPath;
-        setPaths(prevPaths => [...prevPaths, { id: np.id ?? Date.now(), brushStyle: np.brushStyle ?? 'brush', ...np }]);
+        setPaths((prevPaths) => {
+          const id = np.id ?? Date.now();
+          const exists = prevPaths.some((pathItem) => pathItem.id === id);
+          if (exists) {
+            return prevPaths.map((pathItem) =>
+              pathItem.id === id ? { ...pathItem, ...np, brushStyle: np.brushStyle ?? pathItem.brushStyle ?? 'brush' } : pathItem
+            );
+          }
+          return [...prevPaths, { id, brushStyle: np.brushStyle ?? 'brush', ...np }];
+        });
       }
       if (data.newShape) {
-        setShapes(prevShapes => [...prevShapes, data.newShape]);
+        setShapes((prevShapes) => {
+          const exists = prevShapes.some((shape) => shape.id === data.newShape.id);
+          return exists
+            ? prevShapes.map((shape) => (shape.id === data.newShape.id ? { ...shape, ...data.newShape } : shape))
+            : [...prevShapes, data.newShape];
+        });
       }
       if (data.newImage) {
         const img = new window.Image();
         img.src = data.newImage.src;
-        setImages(prevImages => [...prevImages, { ...data.newImage, element: img }]);
+        setImages((prevImages) => {
+          const exists = prevImages.some((image) => image.id === data.newImage.id);
+          const newImage = { ...data.newImage, element: img };
+          return exists
+            ? prevImages.map((image) => (image.id === data.newImage.id ? newImage : image))
+            : [...prevImages, newImage];
+        });
       }
       if (data.newTextElement) {
-        setTextElements(prevTextElements => [...prevTextElements, data.newTextElement]);
+        const incoming = data.newTextElement;
+        const needsDimensions = !('width' in incoming) || !incoming.width || !('height' in incoming) || !incoming.height;
+        const dimensions = needsDimensions
+          ? measureTextDimensions(incoming.text ?? '', incoming.fontSize ?? 20, incoming.fontFamily ?? 'Inter, sans-serif')
+          : null;
+        const enrichedElement = dimensions ? { ...incoming, width: dimensions.width, height: dimensions.height } : incoming;
+        setTextElements((prevTextElements) => {
+          const exists = prevTextElements.some((textElement) => textElement.id === enrichedElement.id);
+          return exists
+            ? prevTextElements.map((textElement) => (textElement.id === enrichedElement.id ? { ...textElement, ...enrichedElement } : textElement))
+            : [...prevTextElements, enrichedElement];
+        });
+      }
+      if (data.deletedTextElementId) {
+        setTextElements((prev) => prev.filter((item) => item.id !== data.deletedTextElementId));
       }
       if (data.updatedSelection) {
-        const updatedIds = data.updatedSelection.map((item: any) => item.id);
-        const newShapes = shapes.map(shape => {
-          const updatedShape = data.updatedSelection.find((item: any) => item.id === shape.id);
-          return updatedShape || shape;
-        });
-        const newImages = images.map(image => {
-          const updatedImage = data.updatedSelection.find((item: any) => item.id === image.id);
-          return updatedImage || image;
-        });
-        const newTextElements = textElements.map(textElement => {
-          const updatedTextElement = data.updatedSelection.find((item: any) => item.id === textElement.id);
-          return updatedTextElement || textElement;
-        });
-        setShapes(newShapes);
-        setImages(newImages);
-        setTextElements(newTextElements);
+        setShapes((prevShapes) =>
+          prevShapes.map((shape) => {
+            const updated = data.updatedSelection.find((item: any) => item.id === shape.id);
+            return updated && 'width' in updated ? { ...shape, ...updated } : shape;
+          })
+        );
+        setImages((prevImages) =>
+          prevImages.map((image) => {
+            const updated = data.updatedSelection.find((item: any) => item.id === image.id);
+            if (updated && updated.src) {
+              const img = new window.Image();
+              img.src = updated.src;
+              return { ...image, ...updated, element: img } as Img;
+            }
+            return updated ? { ...image, ...updated } : image;
+          })
+        );
+        setTextElements((prevTextElements) =>
+          prevTextElements.map((textElement) => {
+            const updated = data.updatedSelection.find((item: any) => item.id === textElement.id);
+            return updated && 'text' in updated ? { ...textElement, ...updated } : textElement;
+          })
+        );
       }
     });
 
     return () => {
       newSocket.disconnect();
     };
-  }, [room]);
+  }, [room, measureTextDimensions]);
 
   const handlePathsChange = (newPaths: Path[]) => {
     setPaths(newPaths);
@@ -130,15 +324,33 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
     }
   };
 
-  const handleTextElementsChange = (newTextElements: TextElement[]) => {
-    setTextElements(newTextElements);
-    const newTextElement = newTextElements[newTextElements.length - 1];
-    if (newTextElement) {
-      socket?.emit('drawing', { room, newTextElement });
+  const handleTextElementsChange = (
+    updater: TextElement[] | ((prev: TextElement[]) => TextElement[]),
+    change?: TextChange
+  ) => {
+    setTextElements((prev) =>
+      typeof updater === 'function' ? (updater as (prev: TextElement[]) => TextElement[])(prev) : updater
+    );
+    if (!socket || !change) return;
+
+    if (change.type === 'create') {
+      if (change.broadcast === false) return;
+      socket.emit('drawing', { room, newTextElement: change.element });
+      return;
+    }
+
+    if (change.type === 'update') {
+      socket.emit('drawing', { room, updatedSelection: [change.element] });
+      return;
+    }
+
+    if (change.type === 'delete') {
+      socket.emit('drawing', { room, deletedTextElementId: change.id });
     }
   };
 
-  const handleMultiSelectionChange = (newSelection: (Shape | Img)[]) => {
+
+  const handleMultiSelectionChange = (newSelection: (Shape | Img | TextElement)[]) => {
     setMultiSelection(newSelection);
     const selectionData = newSelection.map(item => {
       if ('element' in item) {
@@ -154,6 +366,10 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
       handlePathsChange([]);
       handleShapesChange([]);
       handleImagesChange([]);
+      handleTextElementsChange([]);
+      pendingTextBroadcast.current.clear();
+      setEditingTextElement(null);
+      setCreatingTextId(null);
       handleMultiSelectionChange([]);
       setPan({ x: 0, y: 0 });
       setZoom(1);
@@ -422,9 +638,24 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
         context.drawImage(image.element, image.x, image.y, image.width, image.height);
       });
       textElements.forEach(textElement => {
+        context.save();
         context.font = `${textElement.fontSize}px ${textElement.fontFamily}`;
         context.fillStyle = textElement.color;
-        context.fillText(textElement.text, textElement.x, textElement.y + textElement.fontSize);
+        context.textBaseline = 'top';
+        const rectWidth = Math.max(textElement.width, textElement.fontSize * 2);
+        const rectHeight = Math.max(textElement.height, textElement.fontSize * 1.4);
+        if (rectWidth && rectHeight) {
+          context.beginPath();
+          context.rect(textElement.x, textElement.y, rectWidth, rectHeight);
+          context.clip();
+        }
+        const lines = (textElement.text ?? '').split('\n');
+        const lineHeight = textElement.fontSize * 1.2;
+        lines.forEach((line, index) => {
+          const content = line.length ? line : ' ';
+          context.fillText(content, textElement.x, textElement.y + index * lineHeight);
+        });
+        context.restore();
       });
 
       if (selectionBox) {
@@ -509,15 +740,36 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
       const y = (offsetY - pan.y) / zoom;
       setStartPoint({ x, y });
 
-      if (tool === 'pen' || tool === 'bruh' || tool === 'eraser') {
+      if (tool === 'pen' || tool === 'bruh') {
         const newPath: Path = { id: Date.now(), points: [{ x, y }], color, strokeWidth, brushStyle };
         handlePathsChange([...paths, newPath]);
+      } else if (tool === 'eraser') {
+        eraseAtPoint(x, y);
       } else if (tool === 'shape') {
         const newShape: Shape = { id: Date.now(), x, y, width: 0, height: 0, color, strokeWidth, type: shape };
         handleShapesChange([...shapes, newShape]);
       } else if (tool === 'text') {
-        const newTextElement: TextElement = { id: Date.now(), x, y, text: '', fontSize: 20, fontFamily: 'Arial', color, width: 0, height: 0 };
-        handleTextElementsChange([...textElements, newTextElement]);
+        const id = Date.now();
+        const fontSize = 20;
+        const fontFamily = 'Inter, sans-serif';
+        const newTextElement: TextElement = {
+          id,
+          x,
+          y,
+          text: '',
+          fontSize,
+          fontFamily,
+          color,
+          width: 0,
+          height: 0,
+        };
+        pendingTextBroadcast.current.add(id);
+        handleTextElementsChange((prev) => [...prev, newTextElement], {
+          type: 'create',
+          element: newTextElement,
+          broadcast: false,
+        });
+        setCreatingTextId(id);
         setEditingTextElement(newTextElement);
       } else if (tool === 'select') {
         if (multiSelection.length > 0) {
@@ -544,12 +796,14 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
       const x = (offsetX - pan.x) / zoom;
       const y = (offsetY - pan.y) / zoom;
 
-      if (tool === 'pen' || tool === 'bruh' || tool === 'eraser') {
+      if (tool === 'pen' || tool === 'bruh') {
         if (paths.length > 0) {
           const newPaths = [...paths];
           newPaths[newPaths.length - 1].points.push({ x, y });
           handlePathsChange(newPaths);
         }
+      } else if (tool === 'eraser') {
+        eraseAtPoint(x, y);
       } else if (tool === 'shape') {
         if (shapes.length > 0) {
           const newShapes = [...shapes];
@@ -558,6 +812,31 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
           currentShape.height = y - startPoint.y;
           handleShapesChange(newShapes);
         }
+      } else if (tool === 'text' && creatingTextId !== null) {
+        setTextElements((prev) =>
+          prev.map((textElement) => {
+            if (textElement.id !== creatingTextId) return textElement;
+            const nextX = Math.min(startPoint.x, x);
+            const nextY = Math.min(startPoint.y, y);
+            const width = Math.max(Math.abs(x - startPoint.x), textElement.fontSize * 2);
+            const height = Math.max(Math.abs(y - startPoint.y), textElement.fontSize * 1.4);
+            if (
+              Math.abs(textElement.x - nextX) < 0.001 &&
+              Math.abs(textElement.y - nextY) < 0.001 &&
+              Math.abs(textElement.width - width) < 0.001 &&
+              Math.abs(textElement.height - height) < 0.001
+            ) {
+              return textElement;
+            }
+            return {
+              ...textElement,
+              x: nextX,
+              y: nextY,
+              width,
+              height,
+            };
+          })
+        );
       } else if (tool === 'select') {
         if (moving && multiSelection.length > 0) {
           const dx = x - startPoint.x;
@@ -579,13 +858,14 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
           });
           handleImagesChange(newImages);
 
-          const newTextElements = textElements.map(textElement => {
-            if (multiSelection.find(item => item.id === textElement.id)) {
-              return { ...textElement, x: textElement.x + dx, y: textElement.y + dy };
-            }
-            return textElement;
-          });
-          handleTextElementsChange(newTextElements);
+          handleTextElementsChange((prev) =>
+            prev.map((textElement) => {
+              if (multiSelection.find((item) => item.id === textElement.id)) {
+                return { ...textElement, x: textElement.x + dx, y: textElement.y + dy };
+              }
+              return textElement;
+            })
+          );
 
           const newSelection = multiSelection.map(item => ({ ...item, x: item.x + dx, y: item.y + dy }));
           setMultiSelection(newSelection);
@@ -646,11 +926,14 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
           });
           handleImagesChange(newImages as Img[]);
 
-          const newTextElements = textElements.map(textElement => {
-            const updatedTextElement = newSelection.find(item => item.id === textElement.id);
-            return updatedTextElement && 'text' in updatedTextElement ? updatedTextElement : textElement;
-          });
-          handleTextElementsChange(newTextElements as TextElement[]);
+          handleTextElementsChange((prev) =>
+            prev.map((textElement) => {
+              const updatedTextElement = newSelection.find((item) => item.id === textElement.id);
+              return updatedTextElement && 'text' in updatedTextElement
+                ? (updatedTextElement as TextElement)
+                : textElement;
+            })
+          );
 
         } else if (selectionBox) {
           setSelectionBox({
@@ -670,6 +953,23 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
     }
     if (moving || resizingHandle) {
       socket?.emit('drawing', { room, updatedSelection: multiSelection, shapes, images, textElements });
+    }
+    if (tool === 'text' && creatingTextId !== null) {
+      const created = textElements.find((textElement) => textElement.id === creatingTextId);
+      if (created) {
+        const minWidth = Math.max(created.fontSize * 4, 40);
+        const minHeight = Math.max(created.fontSize * 1.4, 32);
+        const normalized: TextElement = {
+          ...created,
+          width: Math.max(created.width, minWidth),
+          height: Math.max(created.height, minHeight),
+        };
+        handleTextElementsChange((prev) =>
+          prev.map((textElement) => (textElement.id === normalized.id ? normalized : textElement))
+        );
+        setEditingTextElement(normalized);
+      }
+      setCreatingTextId(null);
     }
     setDrawing(false);
     setSelectionBox(null);
@@ -721,30 +1021,93 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
         className={`whiteboard-canvas absolute top-0 left-0 w-full h-full ${tool === 'select' ? 'cursor-default' : 'cursor-crosshair'}`}
       />
       {editingTextElement && (
-        <input
-          type="text"
+        <textarea
           value={editingTextElement.text}
-          onChange={(e) => {
-            const newTextElements = textElements.map(te =>
-              te.id === editingTextElement.id ? { ...te, text: e.target.value } : te
+          onChange={(event) => {
+            const value = event.target.value;
+            const metrics = measureTextDimensions(
+              value,
+              editingTextElement.fontSize,
+              editingTextElement.fontFamily,
+              editingTextElement.width,
+              editingTextElement.height
             );
-            setTextElements(newTextElements);
-            setEditingTextElement(prev => prev ? { ...prev, text: e.target.value } : null);
+            const updated: TextElement = {
+              ...editingTextElement,
+              text: value,
+              height: Math.max(editingTextElement.height, metrics.height),
+            };
+            const isPending = pendingTextBroadcast.current.has(updated.id);
+            let change: TextChange | undefined;
+            if (isPending) {
+              if (value.trim().length > 0) {
+                pendingTextBroadcast.current.delete(updated.id);
+                change = { type: 'create', element: updated };
+              }
+            } else {
+              change = { type: 'update', element: updated };
+            }
+            handleTextElementsChange(
+              (prev) => prev.map((textElement) => (textElement.id === updated.id ? updated : textElement)),
+              change
+            );
+            setEditingTextElement(updated);
           }}
-          onBlur={() => setEditingTextElement(null)}
+          onBlur={() => {
+            const current = editingTextElement;
+            if (!current) return;
+            const trimmed = current.text.trim();
+            if (trimmed.length === 0) {
+              const isPending = pendingTextBroadcast.current.has(current.id);
+              pendingTextBroadcast.current.delete(current.id);
+              handleTextElementsChange(
+                (prev) => prev.filter((textElement) => textElement.id !== current.id),
+                isPending ? undefined : { type: 'delete', id: current.id }
+              );
+            } else {
+              const metrics = measureTextDimensions(
+                current.text,
+                current.fontSize,
+                current.fontFamily,
+                current.width,
+                current.height
+              );
+              const normalized: TextElement = {
+                ...current,
+                width: Math.max(current.width, metrics.width),
+                height: Math.max(current.height, metrics.height),
+              };
+              const isPending = pendingTextBroadcast.current.has(normalized.id);
+              pendingTextBroadcast.current.delete(normalized.id);
+              handleTextElementsChange(
+                (prev) => prev.map((textElement) => (textElement.id === normalized.id ? normalized : textElement)),
+                isPending ? { type: 'create', element: normalized } : { type: 'update', element: normalized }
+              );
+            }
+            setEditingTextElement(null);
+          }}
           style={{
             position: 'absolute',
             left: editingTextElement.x * zoom + pan.x,
             top: editingTextElement.y * zoom + pan.y,
-            fontSize: editingTextElement.fontSize * zoom,
+            width: `${Math.max(editingTextElement.width, editingTextElement.fontSize * 4)}px`,
+            height: `${Math.max(editingTextElement.height, editingTextElement.fontSize * 1.4)}px`,
+            fontSize: editingTextElement.fontSize,
             fontFamily: editingTextElement.fontFamily,
+            lineHeight: `${editingTextElement.fontSize * 1.2}px`,
             color: editingTextElement.color,
-            border: '1px solid black',
-            background: 'transparent',
+            border: '1px solid hsl(var(--primary))',
+            background: 'rgba(255,255,255,0.92)',
             outline: 'none',
             transformOrigin: 'top left',
             transform: `scale(${zoom})`,
+            padding: '6px 8px',
+            borderRadius: '6px',
+            resize: 'none',
+            whiteSpace: 'pre-wrap',
+            overflow: 'auto',
           }}
+          spellCheck={false}
           autoFocus
         />
       )}
@@ -753,3 +1116,11 @@ const Whiteboard: React.FC<WhiteboardProps> = ({ room, tool, color, strokeWidth,
 };
 
 export default Whiteboard;
+
+
+
+
+
+
+
+

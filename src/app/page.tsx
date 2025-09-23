@@ -79,6 +79,7 @@ export default function Home() {
         setStrokeWidth={setStrokeWidth}
         brushStyle={brushStyle}
         setBrushStyle={setBrushStyle}
+        tool={tool}
       />
       <BottomBar zoom={zoom} zoomIn={handleZoomIn} zoomOut={handleZoomOut} resetZoom={handleResetZoom} />
     </main>
